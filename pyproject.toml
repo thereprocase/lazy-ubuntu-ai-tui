@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-ai-tui"
+version = "0.1.0"
+description = "Ubuntu TUI for NVIDIA GGUF inference, Open WebUI and Tailscale"
+requires-python = ">=3.11"
+dependencies = ["textual>=0.80", "huggingface_hub>=0.27"]
+
+[project.scripts]
+local-ai-tui = "local_ai_tui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

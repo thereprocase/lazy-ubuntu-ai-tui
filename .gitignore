@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest-tmp/
+.venv*/
+webui.env
+stack.json
+compose.json
+models/
+logs/
+*.gguf
+*.log
+.env
+.env.*
