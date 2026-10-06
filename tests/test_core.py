@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from local_ai_tui.core import Config, GPU, compose_document, memory_advice, validate, write_plan
+from local_ai_tui.core import Config, GPU, K3_BACKEND, K3_REPO, MODEL_PRESETS, compose_document, memory_advice, validate, write_plan
 
 
 def test_architecture_uses_compute_capability_not_product_name():
@@ -68,3 +68,23 @@ def test_remote_tailnet_connection_keeps_key_out_of_plan(tmp_path: Path):
     assert "secret-token" not in (plan.parent / "stack.json").read_text()
     assert "OPENAI_API_KEYS=local;secret-token" in (plan.parent / "webui.env").read_text()
     assert compose_document(config)["services"]["open-webui"]["environment"]["OPENAI_API_BASE_URLS"].endswith(";https://models.example.ts.net/v1")
+
+
+def test_k3_plan_uses_pinned_fork_and_cpu_offload(tmp_path: Path):
+    model = tmp_path / "Kimi-K3-UD-IQ1_S-00001-of-00002.gguf"
+    model.write_bytes(b"x")
+    gpu = GPU(0, "GPU-abc", "Quadro RTX 6000", 24576, "7.5")
+    config = Config(install_dir=str(tmp_path / "stack"), model_path=str(model), repo_id=K3_REPO, quant="UD-IQ1_S", backend=K3_BACKEND, gpu_uuids=[gpu.uuid])
+    assert any("Missing 1 GGUF shard" in error for error in validate(config, [gpu]))
+    (tmp_path / "Kimi-K3-UD-IQ1_S-00002-of-00002.gguf").write_bytes(b"y")
+    assert validate(config, [gpu]) == []
+    plan = write_plan(config, [gpu])
+    document = json.loads(plan.read_text())
+    llama = document["services"]["llama"]
+    assert llama["build"]["args"]["CUDA_ARCHITECTURES"] == "75"
+    assert "--cpu-moe" in llama["command"]
+    assert "768d2a481a99cb75ec9a03b95dadbd35e7acf496" in (plan.parent / "Dockerfile.kimi-k3").read_text()
+    assert MODEL_PRESETS["kimi-k3-1bit"][1] == K3_REPO
+    if shutil.which("docker"):
+        result = subprocess.run(["docker", "compose", "-f", str(plan), "config", "--quiet"], text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr

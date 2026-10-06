@@ -15,9 +15,28 @@ from typing import Any
 from urllib.parse import urlparse
 
 LOG = logging.getLogger("local_ai_tui")
-DEFAULT_REPO = "unsloth/Qwen3.8-Flash-Next-GGUF"
-DEFAULT_QUANT = "UD-Q4_K_XL"
+DEFAULT_REPO = "ggml-org/Qwen3.8-27B-GGUF"
+DEFAULT_QUANT = "Qwen3.8-27B-Q8_0.gguf"
 GPU_QUERY = "index,uuid,name,memory.total,compute_cap"
+K3_REPO = "unsloth/Kimi-K3-GGUF"
+K3_BACKEND = "unsloth-k3"
+K3_SOURCE_SHA = "768d2a481a99cb75ec9a03b95dadbd35e7acf496"
+K3_DOCKERFILE = f"""FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+RUN apt-get update && apt-get install -y --no-install-recommends git cmake build-essential libcurl4-openssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN git clone https://github.com/unslothai/llama.cpp /src && cd /src && git fetch origin pull/48/head && git checkout {K3_SOURCE_SHA}
+ARG CUDA_ARCHITECTURES=75;80;86;89;90;100;120
+RUN cmake -S /src -B /src/build -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=\"${{CUDA_ARCHITECTURES}}\" && cmake --build /src/build --config Release -j 4 --target llama-server
+ENTRYPOINT [\"/src/build/bin/llama-server\"]
+"""
+MODEL_PRESETS = {
+    "qwen-dual": ("Qwen3.8 27B Q8 · dual GPU · 28.6 GB", DEFAULT_REPO, DEFAULT_QUANT, 65536, "standard", 29),
+    "qwen-24": ("Qwen3.8 27B Q5 · 24 GB GPU · 20.9 GB", "bartowski/Qwen3.8-27B-GGUF", "Qwen3.8-27B-Q5_K_M.gguf", 32768, "standard", 21),
+    "qwen-16": ("Qwen3.8 27B Q3 · 16 GB GPU · 13.4 GB", "bartowski/Qwen3.8-27B-GGUF", "Qwen3.8-27B-Q3_K_M.gguf", 16384, "standard", 14),
+    "qwen-fast-16": ("Qwen3.5 9B Q8 · 16 GB GPU · 9.5 GB", "unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-Q8_0.gguf", 65536, "standard", 10),
+    "kimi-linear": ("Kimi Linear 48B A3B Q4 · dual GPU · 30.1 GB", "bartowski/moonshotai_Kimi-Linear-48B-A3B-Instruct-GGUF", "moonshotai_Kimi-Linear-48B-A3B-Instruct-Q4_K_M.gguf", 65536, "standard", 31),
+    "kimi-k3-1bit": ("Kimi K3 IQ1_S · RAM offload · 594 GB", K3_REPO, "UD-IQ1_S", 65536, K3_BACKEND, 610),
+    "kimi-k3-2bit": ("Kimi K3 Q2_K_XL · RAM offload · 861 GB", K3_REPO, "UD-Q2_K_XL", 65536, K3_BACKEND, 880),
+}
 
 
 @dataclass(frozen=True)
@@ -59,12 +78,13 @@ class Config:
     repo_id: str = DEFAULT_REPO
     quant: str = DEFAULT_QUANT
     gpu_uuids: list[str] = field(default_factory=list)
-    context: int = 8192
+    context: int = 65536
     webui_port: int = 3000
     split_mode: str = "layer"
     tensor_split: str = ""
     gpu_layers: int | None = None
     llama_image: str = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+    backend: str = "standard"
     webui_image: str = "ghcr.io/open-webui/open-webui:main"
     tailscale_mode: str = "off"  # off, serve
     tailscale_https_port: int = 443
@@ -157,6 +177,18 @@ def validate(config: Config, gpus: list[GPU]) -> list[str]:
         errors.append("Tensor split must be comma-separated nonnegative numbers")
     if config.tensor_split and len(config.tensor_split.split(",")) != len(config.gpu_uuids):
         errors.append("Tensor split needs one value per selected GPU")
+    if config.backend not in {"standard", K3_BACKEND}:
+        errors.append("Unknown llama.cpp backend")
+    if config.repo_id == K3_REPO and config.backend != K3_BACKEND:
+        errors.append("Kimi K3 requires the Unsloth K3 backend")
+    if config.backend == K3_BACKEND and config.repo_id != K3_REPO:
+        errors.append("Unsloth K3 backend is only for Kimi K3")
+    if config.backend == K3_BACKEND and config.split_mode != "layer":
+        errors.append("Kimi K3 RAM offload requires layer split mode")
+    if config.backend == K3_BACKEND and config.gpu_layers is not None:
+        errors.append("Leave GPU layers automatic for Kimi K3 RAM offload")
+    if config.backend == K3_BACKEND and config.tensor_split:
+        errors.append("Leave tensor split automatic for Kimi K3 RAM offload")
     if config.tailscale_mode not in {"off", "serve"}:
         errors.append("Tailscale mode must be off or serve")
     if not 1 <= config.tailscale_https_port <= 65535:
@@ -177,7 +209,27 @@ def validate(config: Config, gpus: list[GPU]) -> list[str]:
             errors.append("Remote endpoint URL cannot contain a semicolon")
     if any(ch in config.remote_api_key for ch in "\r\n;"):
         errors.append("Remote API key cannot contain a newline or semicolon")
+    if config.backend == K3_BACKEND and Path(config.model_path).is_file():
+        errors.extend(shard_errors(Path(config.model_path)))
     return errors
+
+
+def shard_errors(model: Path) -> list[str]:
+    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", model.name, re.I)
+    if not match:
+        return []
+    prefix, index, total = match.groups()
+    if index != "00001":
+        return ["Select the first GGUF shard"]
+    missing = [number for number in range(1, int(total) + 1) if not (model.parent / f"{prefix}-{number:05d}-of-{total}.gguf").is_file()]
+    return [f"Missing {len(missing)} GGUF shard(s); download the complete quant"] if missing else []
+
+
+def system_ram_gib() -> float | None:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def memory_advice(config: Config, gpus: list[GPU]) -> str:
@@ -188,15 +240,21 @@ def memory_advice(config: Config, gpus: list[GPU]) -> str:
     legacy = any(float(gpu.compute_cap) < 7.5 for gpu in chosen if re.fullmatch(r"\d+\.\d+", gpu.compute_cap))
     architecture_note = " Older GPUs may need a custom CUDA 12 build or CPU image." if legacy else ""
     model = Path(config.model_path)
+    ram = system_ram_gib()
+    ram_note = f"; RAM {ram:.0f} GiB" if ram is not None else ""
     if not model.is_file():
-        return f"Selected VRAM: {total / 1024:.1f} GiB. Select a GGUF to estimate fit.{architecture_note}"
+        return f"Selected VRAM: {total / 1024:.1f} GiB{ram_note}. Select a GGUF to estimate fit.{architecture_note}"
     files = list(model.parent.glob("*.gguf"))
     prefix = re.sub(r"-\d{5}-of-\d{5}\.gguf$", "", model.name, flags=re.I)
     related = [p for p in files if p.name == model.name or p.name.startswith(prefix + "-")]
     size = sum(p.stat().st_size for p in related) / 2**30
     headroom = total / 1024 - size
     note = "Likely needs CPU offload; throughput may be low." if headroom < 8 else "Weight fit looks plausible; context and runtime need headroom."
-    return f"Model ~{size:.1f} GiB; GPUs {total / 1024:.1f} GiB; headroom ~{headroom:.1f} GiB. {note}{architecture_note}"
+    if config.backend == K3_BACKEND:
+        note = "K3 needs substantial CPU offload and Unsloth's fork; expect slow generation."
+        if ram is not None and ram + total / 1024 < size + 16:
+            note += " RAM + VRAM may be insufficient."
+    return f"Model ~{size:.1f} GiB; GPUs {total / 1024:.1f} GiB{ram_note}; VRAM headroom ~{headroom:.1f} GiB. {note}{architecture_note}"
 
 
 def compose_document(config: Config) -> dict[str, Any]:
@@ -220,16 +278,20 @@ def compose_document(config: Config) -> dict[str, Any]:
     else:
         webui_environment["OPENAI_API_BASE_URL"] = "http://llama:8080/v1"
         webui_environment["OPENAI_API_KEY"] = "local"
+    llama_service = {
+        "image": config.llama_image if config.backend == "standard" else "local-ai-tui/kimi-k3:local",
+        "restart": "unless-stopped",
+        "logging": {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}},
+        "command": command,
+        "volumes": mounts,
+        "deploy": {"resources": {"reservations": {"devices": [{"driver": "nvidia", "device_ids": config.gpu_uuids, "capabilities": ["gpu"]}]}}},
+    }
+    if config.backend == K3_BACKEND:
+        llama_service["build"] = {"context": ".", "dockerfile": "Dockerfile.kimi-k3", "args": {"CUDA_ARCHITECTURES": "75;80;86;89;90;100;120"}}
+        command += ["--fit", "on", "--cpu-moe"]
     return {
         "services": {
-            "llama": {
-                "image": config.llama_image,
-                "restart": "unless-stopped",
-                "logging": {"driver": "json-file", "options": {"max-size": "20m", "max-file": "5"}},
-                "command": command,
-                "volumes": mounts,
-                "deploy": {"resources": {"reservations": {"devices": [{"driver": "nvidia", "device_ids": config.gpu_uuids, "capabilities": ["gpu"]}]}}},
-            },
+            "llama": llama_service,
             "open-webui": {
                 "image": config.webui_image,
                 "restart": "unless-stopped",
@@ -252,7 +314,14 @@ def write_plan(config: Config, gpus: list[GPU]) -> Path:
     directory = Path(config.install_dir).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     compose = directory / "compose.json"
-    compose.write_text(json.dumps(compose_document(config), indent=2) + "\n", encoding="utf-8")
+    document = compose_document(config)
+    if config.backend == K3_BACKEND:
+        architectures = sorted({gpu.compute_cap.replace(".", "") for gpu in gpus if gpu.uuid in config.gpu_uuids and re.fullmatch(r"\d+\.\d+", gpu.compute_cap)})
+        if architectures:
+            document["services"]["llama"]["build"]["args"]["CUDA_ARCHITECTURES"] = ";".join(architectures)
+    compose.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    if config.backend == K3_BACKEND:
+        (directory / "Dockerfile.kimi-k3").write_text(K3_DOCKERFILE, encoding="utf-8")
     saved = asdict(config)
     saved.pop("remote_api_key")
     (directory / "stack.json").write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
@@ -276,7 +345,7 @@ def deploy(config: Config, gpus: list[GPU]) -> str:
         raise RuntimeError("; ".join(issues))
     compose = write_plan(config, gpus)
     run(["docker", "compose", "-f", str(compose), "config", "--quiet"])
-    run(["docker", "compose", "-f", str(compose), "up", "-d"], timeout=None)
+    run(["docker", "compose", "-f", str(compose), "up", "-d", "--build"], timeout=None)
     return f"Stack started. Open http://127.0.0.1:{config.webui_port}"
 
 

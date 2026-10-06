@@ -4,13 +4,14 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 import re
+import shutil
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, Label, RichLog, Select, Static, TabbedContent, TabPane
 
-from .core import Config, DEFAULT_QUANT, DEFAULT_REPO, GPU, check_prerequisites, configure_logging, deploy, detect_gpus, enable_tailscale, memory_advice, save_service_logs, write_plan
+from .core import Config, DEFAULT_QUANT, DEFAULT_REPO, GPU, K3_BACKEND, K3_REPO, MODEL_PRESETS, check_prerequisites, configure_logging, deploy, detect_gpus, enable_tailscale, memory_advice, save_service_logs, write_plan
 
 LOG = logging.getLogger("local_ai_tui")
 
@@ -36,6 +37,7 @@ class LocalAIApp(App):
         self.config = Config()
         self.gpus: list[GPU] = []
         self.quant_files: dict[str, list[str]] = {}
+        self.quant_sizes: dict[str, int] = {}
         self.log_file = configure_logging()
 
     def compose(self) -> ComposeResult:
@@ -53,7 +55,11 @@ class LocalAIApp(App):
             with TabPane("Models", id="models"):
                 with VerticalScroll():
                     yield Static("Search Hugging Face GGUF repositories, inspect their quantizations, download a selection, or link an existing local file.", classes="hint")
-                    yield Input(value="Qwen3.8-Flash-Next", placeholder="Search GGUF models", id="search", classes="field")
+                    yield Label("Recommended starting points")
+                    yield Select(tuple((item[0], key) for key, item in MODEL_PRESETS.items()), value="qwen-dual", id="preset", classes="field")
+                    yield Button("Apply recommendation", id="apply-preset")
+                    yield Static("Kimi K3 is a RAM-offload experiment: 594 GB to 861 GB download, Unsloth fork build, and slow generation on small GPUs.", classes="hint")
+                    yield Input(value="Qwen3.8-27B", placeholder="Search GGUF models", id="search", classes="field")
                     yield Button("Search", id="search-button")
                     yield DataTable(id="repos")
                     yield Input(value=DEFAULT_REPO, placeholder="owner/repository", id="repo", classes="field")
@@ -67,8 +73,9 @@ class LocalAIApp(App):
             with TabPane("Stack", id="stack"):
                 with VerticalScroll():
                     yield Input(value=self.config.install_dir, placeholder="Deployment directory", id="install-dir", classes="field")
-                    yield Input(value="8192", placeholder="Context tokens", id="context", classes="field advanced")
+                    yield Input(value="65536", placeholder="Context tokens", id="context", classes="field advanced")
                     yield Input(value="3000", placeholder="Open WebUI localhost port", id="webui-port", classes="field advanced")
+                    yield Select((("Standard llama.cpp CUDA", "standard"), ("Unsloth Kimi K3 fork (build locally)", K3_BACKEND)), value="standard", id="backend", classes="field advanced")
                     yield Select((("Layer", "layer"), ("Row", "row"), ("None", "none")), value="layer", id="split-mode", classes="field expert")
                     yield Input(placeholder="GPU layers (blank = automatic fit)", id="gpu-layers", classes="field expert")
                     yield Input(placeholder="Tensor split ratios, e.g. 3,2,1", id="tensor-split", classes="field expert")
@@ -115,6 +122,19 @@ class LocalAIApp(App):
         if event.select.id == "complexity":
             self._complexity()
 
+    def _apply_preset(self) -> None:
+        key = str(self.query_one("#preset", Select).value)
+        label, repo, quant, context, backend, memory_gb = MODEL_PRESETS[key]
+        self.query_one("#repo", Input).value = repo
+        self.query_one("#quant", Input).value = quant
+        self.query_one("#context", Input).value = str(context)
+        self.query_one("#backend", Select).value = backend
+        self.query_one("#model-path", Input).value = ""
+        self.query_one("#mmproj-path", Input).value = ""
+        self._update_memory()
+        self._say(f"Selected {label}. Inspect repository, select its GGUF group, then download or link a local file. Approximate memory requirement: {memory_gb} GB plus runtime overhead.")
+        self.inspect_worker(repo)
+
     async def _render_gpus(self) -> None:
         container = self.query_one("#gpu-list", Vertical)
         await container.remove_children()
@@ -158,6 +178,7 @@ class LocalAIApp(App):
         self.config.tensor_split = value("tensor-split")
         self.config.gpu_layers = int(value("gpu-layers")) if value("gpu-layers") else None
         self.config.llama_image = value("llama-image")
+        self.config.backend = str(self.query_one("#backend", Select).value)
         self.config.webui_image = value("webui-image")
         self.config.tailscale_mode = str(self.query_one("#tailscale-mode", Select).value)
         self.config.tailscale_https_port = int(value("tailscale-port"))
@@ -177,6 +198,8 @@ class LocalAIApp(App):
                 self.search_worker(self.query_one("#search", Input).value.strip())
             elif button == "inspect":
                 self.inspect_worker(self.query_one("#repo", Input).value.strip())
+            elif button == "apply-preset":
+                self._apply_preset()
             elif button == "download":
                 self.download_worker(self.query_one("#repo", Input).value.strip(), self.query_one("#quant", Input).value.strip(), self.query_one("#install-dir", Input).value.strip())
             elif button == "plan":
@@ -256,6 +279,7 @@ class LocalAIApp(App):
         table = self.query_one("#quants", DataTable)
         table.clear()
         self.quant_files = {group: [path for path, _ in files] for group, files in grouped.items()}
+        self.quant_sizes = {group: sum(size for _, size in files) for group, files in grouped.items()}
         for group, files in sorted(grouped.items()):
             table.add_row(group, f"{sum(size for _, size in files) / 2**30:.1f}", str(len(files)), key=group)
         self._say(f"Found {len(grouped)} GGUF groups. Select one to download.")
@@ -269,16 +293,23 @@ class LocalAIApp(App):
                 raise ValueError("Inspect the repository and select a quant first")
             target = Path(install_dir).expanduser() / "models" / repo.replace("/", "--")
             target.mkdir(parents=True, exist_ok=True)
+            required = self.quant_sizes.get(quant, 0)
+            if required and shutil.disk_usage(target).free < required * 1.05:
+                raise RuntimeError(f"Not enough free disk space for {required / 2**30:.1f} GiB quant")
+            if repo == K3_REPO:
+                files = [*files, "mmproj-BF16.gguf"]
             self.call_from_thread(self._say, f"Downloading {len(files)} GGUF file(s) to {target} …")
             snapshot_download(repo_id=repo, allow_patterns=files, local_dir=target)
-            first = sorted(files)[0]
-            self.call_from_thread(self._downloaded, str(target / first))
+            first = sorted(path for path in files if path.lower().endswith(".gguf") and "mmproj" not in path.lower())[0]
+            self.call_from_thread(self._downloaded, str(target / first), str(target / "mmproj-BF16.gguf") if repo == K3_REPO else "")
         except Exception as exc:
             LOG.exception("Model download failed")
             self.call_from_thread(self._say, f"Download failed: {exc}", True)
 
-    def _downloaded(self, path: str) -> None:
+    def _downloaded(self, path: str, mmproj: str = "") -> None:
         self.query_one("#model-path", Input).value = path
+        if mmproj:
+            self.query_one("#mmproj-path", Input).value = mmproj
         self._update_memory()
         self._say(f"Model linked: {path}")
 
